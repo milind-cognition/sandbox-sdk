@@ -487,6 +487,43 @@ describe('LocalMountSyncManager', () => {
       await manager.stop();
     });
 
+    it('should normalize leading-slash prefix for R2 compatibility', async () => {
+      const r2Objects = new Map([
+        ['data/file.txt', { body: 'content', etag: 'etag1' }]
+      ]);
+      const bucket = createMockR2Bucket(r2Objects);
+      const fileClient = createMockFileClient();
+      const watchClient = createMockWatchClient();
+      const client = createMockSandboxClient(fileClient, watchClient);
+
+      const manager = new LocalMountSyncManager({
+        bucket: bucket as unknown as R2Bucket,
+        mountPath: '/mnt/data',
+        prefix: '/data/',
+        readOnly: true,
+        client,
+        sessionId: 'test-session',
+        logger
+      });
+
+      await manager.start();
+
+      // Leading slash should be stripped so R2 list matches real keys
+      expect(bucket.list).toHaveBeenCalledWith(
+        expect.objectContaining({ prefix: 'data/' })
+      );
+
+      // Container path should have prefix stripped correctly
+      expect(fileClient.writeFile).toHaveBeenCalledWith(
+        '/mnt/data/file.txt',
+        expect.any(String),
+        'test-session',
+        { encoding: 'base64' }
+      );
+
+      await manager.stop();
+    });
+
     it('should handle prefix without trailing slash', async () => {
       const r2Objects = new Map([
         ['uploads/photo.jpg', { body: 'img', etag: 'etag1' }]
@@ -842,6 +879,50 @@ describe('LocalMountSyncManager', () => {
       await flush();
 
       // R2 key should include prefix
+      expect(bucket.put).toHaveBeenCalledWith(
+        'uploads/photo.jpg',
+        expect.any(Uint8Array)
+      );
+
+      close();
+      await manager.stop();
+    });
+
+    it('should normalize leading-slash prefix when uploading to R2', async () => {
+      const r2Objects = new Map<string, { body: string; etag: string }>();
+      const bucket = createMockR2Bucket(r2Objects);
+      const fileClient = createMockFileClient();
+      const {
+        client: watchClient,
+        emit,
+        close
+      } = createControllableWatchClient();
+      const client = createMockSandboxClient(fileClient, watchClient);
+
+      const manager = new LocalMountSyncManager({
+        bucket: bucket as unknown as R2Bucket,
+        mountPath: '/mnt/data',
+        prefix: '/uploads/',
+        readOnly: false,
+        client,
+        sessionId: 'test-session',
+        logger,
+        pollIntervalMs: 60_000
+      });
+
+      await manager.start();
+
+      emit({
+        type: 'event',
+        eventType: 'create',
+        path: '/mnt/data/photo.jpg',
+        isDirectory: false,
+        timestamp: new Date().toISOString()
+      });
+
+      await flush();
+
+      // R2 key should use normalized prefix without leading slash
       expect(bucket.put).toHaveBeenCalledWith(
         'uploads/photo.jpg',
         expect.any(Uint8Array)

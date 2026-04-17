@@ -55,7 +55,8 @@ export class LocalMountSyncManager {
   constructor(options: LocalMountSyncOptions) {
     this.bucket = options.bucket;
     this.mountPath = options.mountPath;
-    this.prefix = options.prefix;
+    // Strip leading slash so the prefix matches raw R2 key format
+    this.prefix = options.prefix?.replace(/^\//, '') || undefined;
     this.readOnly = options.readOnly;
     this.client = options.client;
     this.sessionId = options.sessionId;

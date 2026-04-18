@@ -130,21 +130,68 @@ export type {
   ExecutionCallbacks,
   InterpreterClient
 } from './clients/interpreter-client.js';
-// Export backup and process readiness errors
+export type { ErrorCodeType, OperationType } from './errors';
+// Export all error classes for instanceof-based error handling
+// Export error adapter and shared error constants
 export {
+  // Backup Errors
   BackupCreateError,
   BackupExpiredError,
   BackupNotFoundError,
   BackupRestoreError,
+  // Code Interpreter Errors
+  CodeExecutionError,
+  // Command Errors
+  CommandError,
+  CommandNotFoundError,
+  ContextNotFoundError,
+  // Port Errors
+  CustomDomainRequiredError,
+  createErrorFromResponse,
+  // Desktop Errors
   DesktopInvalidCoordinatesError,
   DesktopInvalidOptionsError,
   DesktopNotStartedError,
   DesktopProcessCrashedError,
   DesktopStartFailedError,
   DesktopUnavailableError,
+  ErrorCode,
+  // File System Errors
+  FileExistsError,
+  FileNotFoundError,
+  FileSystemError,
+  FileTooLargeError,
+  // Git Errors
+  GitAuthenticationError,
+  GitBranchNotFoundError,
+  GitCheckoutError,
+  GitCloneError,
+  GitError,
+  GitNetworkError,
+  GitRepositoryNotFoundError,
+  InterpreterNotReadyError,
   InvalidBackupConfigError,
+  InvalidGitUrlError,
+  InvalidPortError,
+  Operation,
+  PermissionDeniedError,
+  PortAlreadyExposedError,
+  PortError,
+  PortInUseError,
+  PortNotExposedError,
+  // Process Errors
+  ProcessError,
   ProcessExitedBeforeReadyError,
-  ProcessReadyTimeoutError
+  ProcessNotFoundError,
+  ProcessReadyTimeoutError,
+  // Base Error
+  SandboxError,
+  ServiceNotRespondingError,
+  // Session Errors
+  SessionAlreadyExistsError,
+  SessionDestroyedError,
+  // Validation Errors
+  ValidationFailedError
 } from './errors';
 // Export file streaming utilities for binary file support
 export { collectFile, streamFile } from './file-stream';

@@ -145,6 +145,7 @@ export type {
   FileExistsContext,
   FileNotFoundContext,
   FileSystemContext,
+  FileTooLargeContext,
   GitAuthFailedContext,
   GitBranchNotFoundContext,
   GitErrorContext,
@@ -161,6 +162,7 @@ export type {
   ProcessExitedBeforeReadyContext,
   ProcessNotFoundContext,
   ProcessReadyTimeoutContext,
+  SessionAlreadyExistsContext,
   SessionDestroyedContext,
   ValidationFailedContext
 } from './errors';

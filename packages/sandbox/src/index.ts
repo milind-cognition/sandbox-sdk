@@ -130,21 +130,100 @@ export type {
   ExecutionCallbacks,
   InterpreterClient
 } from './clients/interpreter-client.js';
-// Export backup and process readiness errors
+// Export error classes and related types for consumers
+export type {
+  BackupCreateContext,
+  BackupExpiredContext,
+  BackupNotFoundContext,
+  BackupRestoreContext,
+  CodeExecutionContext,
+  CommandErrorContext,
+  CommandNotFoundContext,
+  ContextNotFoundContext,
+  DesktopCoordinateErrorContext,
+  DesktopErrorContext,
+  ErrorCodeType,
+  FileExistsContext,
+  FileNotFoundContext,
+  FileSystemContext,
+  GitAuthFailedContext,
+  GitBranchNotFoundContext,
+  GitErrorContext,
+  GitRepositoryNotFoundContext,
+  InternalErrorContext,
+  InterpreterNotReadyContext,
+  InvalidBackupConfigContext,
+  InvalidPortContext,
+  OperationType,
+  PortAlreadyExposedContext,
+  PortErrorContext,
+  PortNotExposedContext,
+  ProcessErrorContext,
+  ProcessExitedBeforeReadyContext,
+  ProcessNotFoundContext,
+  ProcessReadyTimeoutContext,
+  SessionDestroyedContext,
+  ValidationFailedContext
+} from './errors';
 export {
+  // Backup Errors
   BackupCreateError,
   BackupExpiredError,
   BackupNotFoundError,
   BackupRestoreError,
+  CodeExecutionError,
+  CommandError,
+  // Command Errors
+  CommandNotFoundError,
+  ContextNotFoundError,
+  CustomDomainRequiredError,
+  createErrorFromResponse,
+  // Desktop Errors
   DesktopInvalidCoordinatesError,
   DesktopInvalidOptionsError,
   DesktopNotStartedError,
   DesktopProcessCrashedError,
   DesktopStartFailedError,
   DesktopUnavailableError,
+  ErrorCode,
+  FileExistsError,
+  // File System Errors
+  FileNotFoundError,
+  FileSystemError,
+  FileTooLargeError,
+  GitAuthenticationError,
+  GitBranchNotFoundError,
+  GitCheckoutError,
+  GitCloneError,
+  GitError,
+  GitNetworkError,
+  // Git Errors
+  GitRepositoryNotFoundError,
+  // Code Interpreter Errors
+  InterpreterNotReadyError,
   InvalidBackupConfigError,
+  InvalidGitUrlError,
+  InvalidPortError,
+  Operation,
+  PermissionDeniedError,
+  // Port Errors
+  PortAlreadyExposedError,
+  PortError,
+  PortInUseError,
+  PortNotExposedError,
+  ProcessError,
+  // Process Readiness Errors
   ProcessExitedBeforeReadyError,
-  ProcessReadyTimeoutError
+  // Process Errors
+  ProcessNotFoundError,
+  ProcessReadyTimeoutError,
+  SandboxError,
+  ServiceNotRespondingError,
+  // Session Errors
+  SessionAlreadyExistsError,
+  SessionDestroyedError,
+  // Validation Errors
+  ValidationFailedError
 } from './errors';
 // Export file streaming utilities for binary file support
 export { collectFile, streamFile } from './file-stream';

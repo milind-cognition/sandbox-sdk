@@ -61,6 +61,11 @@ export type {
 } from '@repo/shared';
 // Export type guards for runtime validation
 export { isExecResult, isProcess, isProcessStatus } from '@repo/shared';
+export type {
+  ProcessNotFoundContext,
+  SessionAlreadyExistsContext,
+  SessionDestroyedContext
+} from '@repo/shared/errors';
 // Export all client types from new architecture
 export type {
   BaseApiResponse,
@@ -130,7 +135,7 @@ export type {
   ExecutionCallbacks,
   InterpreterClient
 } from './clients/interpreter-client.js';
-// Export backup and process readiness errors
+// Export error classes
 export {
   BackupCreateError,
   BackupExpiredError,
@@ -144,7 +149,11 @@ export {
   DesktopUnavailableError,
   InvalidBackupConfigError,
   ProcessExitedBeforeReadyError,
-  ProcessReadyTimeoutError
+  ProcessNotFoundError,
+  ProcessReadyTimeoutError,
+  SandboxError,
+  SessionAlreadyExistsError,
+  SessionDestroyedError
 } from './errors';
 // Export file streaming utilities for binary file support
 export { collectFile, streamFile } from './file-stream';

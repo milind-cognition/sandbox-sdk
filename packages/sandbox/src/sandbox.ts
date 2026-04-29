@@ -1300,7 +1300,7 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
     s3fsArgs.push(`url=${options.endpoint}`);
 
     // Log s3fs stderr to a temp file for diagnostics on silent failures
-    const logFile = `/tmp/s3fs_${shellEscape(mountPath).replace(/\//g, '_')}.log`;
+    const logFile = `/tmp/s3fs_${mountPath.replace(/\//g, '_')}.log`;
     s3fsArgs.push(`logfile=${logFile}`);
 
     // Build final command with escaped options

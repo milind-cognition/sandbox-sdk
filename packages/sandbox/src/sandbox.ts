@@ -1299,6 +1299,10 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
     // Add endpoint URL
     s3fsArgs.push(`url=${options.endpoint}`);
 
+    // Log s3fs stderr to a temp file for diagnostics on silent failures
+    const logFile = `/tmp/s3fs_${mountPath.replace(/\//g, '_')}.log`;
+    s3fsArgs.push(`logfile=${logFile}`);
+
     // Build final command with escaped options
     const optionsStr = shellEscape(s3fsArgs.join(','));
     const mountCmd = `s3fs ${shellEscape(bucket)} ${shellEscape(mountPath)} -o ${optionsStr}`;
@@ -1313,6 +1317,56 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
         `S3FS mount failed: ${result.stderr || result.stdout || 'Unknown error'}`
       );
     }
+
+    // s3fs forks a child for the FUSE event loop and the parent exits 0
+    // before the bucket check completes. Poll mountpoint to confirm the
+    // FUSE filesystem actually appeared in the kernel mount table.
+    await this.verifyMountpoint(mountPath, logFile, sessionId);
+  }
+
+  /**
+   * Poll until a path is a mountpoint or the retry budget is exhausted.
+   * Reads the s3fs log file on failure to surface the real error.
+   */
+  private async verifyMountpoint(
+    mountPath: string,
+    logFile: string,
+    sessionId?: string
+  ): Promise<void> {
+    const POLL_INTERVAL_MS = 200;
+    const MAX_ATTEMPTS = 10; // ~2 s total
+
+    const exec = (cmd: string) =>
+      sessionId
+        ? this.execWithSession(cmd, sessionId, { origin: 'internal' })
+        : this.execInternal(cmd);
+
+    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+      const check = await exec(`mountpoint -q ${shellEscape(mountPath)}`);
+      if (check.exitCode === 0) {
+        return;
+      }
+      await new Promise<void>((resolve) =>
+        setTimeout(resolve, POLL_INTERVAL_MS)
+      );
+    }
+
+    // Mount never appeared — collect s3fs log for diagnostics
+    let logTail = '';
+    try {
+      const logResult = await exec(
+        `tail -n 20 ${shellEscape(logFile)} 2>/dev/null`
+      );
+      logTail = (logResult.stdout || logResult.stderr || '').trim();
+    } catch {
+      // Log file may not exist if s3fs died before writing
+    }
+
+    const detail = logTail ? `s3fs log:\n${logTail}` : 'no s3fs log available';
+
+    throw new S3FSMountError(
+      `S3FS mount exited successfully but the FUSE filesystem never appeared at ${mountPath}. ${detail}`
+    );
   }
 
   /**

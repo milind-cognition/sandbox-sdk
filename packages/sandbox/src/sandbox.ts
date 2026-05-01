@@ -1269,7 +1269,13 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
   }
 
   /**
-   * Execute S3FS mount command
+   * Execute S3FS mount command and verify the FUSE filesystem appears.
+   *
+   * s3fs daemonizes by default: the parent process exits 0 before the child
+   * completes its bucket check. When the check fails (wrong bucket, 403, etc.)
+   * the child dies silently and no FUSE mount is established. We poll
+   * `mountpoint -q` after s3fs returns to catch this case, and capture the
+   * s3fs log so the caller gets actionable diagnostics.
    */
   private async executeS3FSMount(
     bucket: string,
@@ -1299,19 +1305,61 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
     // Add endpoint URL
     s3fsArgs.push(`url=${options.endpoint}`);
 
+    // Capture s3fs diagnostic output unless the caller already set a logfile
+    const hasUserLogfile = resolvedOptions.some((opt) =>
+      opt.startsWith('logfile=')
+    );
+    const logFilePath = hasUserLogfile
+      ? undefined
+      : `/tmp/.s3fs-log-${crypto.randomUUID()}`;
+    if (logFilePath) {
+      s3fsArgs.push(`logfile=${logFilePath}`);
+    }
+
     // Build final command with escaped options
     const optionsStr = shellEscape(s3fsArgs.join(','));
     const mountCmd = `s3fs ${shellEscape(bucket)} ${shellEscape(mountPath)} -o ${optionsStr}`;
 
-    // Execute mount command
-    const result = sessionId
-      ? await this.execWithSession(mountCmd, sessionId, { origin: 'internal' })
-      : await this.execInternal(mountCmd);
+    const exec = (cmd: string) =>
+      sessionId
+        ? this.execWithSession(cmd, sessionId, { origin: 'internal' })
+        : this.execInternal(cmd);
 
-    if (result.exitCode !== 0) {
-      throw new S3FSMountError(
-        `S3FS mount failed: ${result.stderr || result.stdout || 'Unknown error'}`
+    try {
+      // Execute mount command
+      const result = await exec(mountCmd);
+
+      if (result.exitCode !== 0) {
+        throw new S3FSMountError(
+          `S3FS mount failed: ${result.stderr || result.stdout || 'Unknown error'}`
+        );
+      }
+
+      // Poll mountpoint(1) to confirm the FUSE filesystem appeared.
+      // 6 attempts × 500 ms sleep = up to ~3 s for the daemon to finish setup.
+      const escapedPath = shellEscape(mountPath);
+      const verifyResult = await exec(
+        `for i in 1 2 3 4 5 6; do mountpoint -q ${escapedPath} && exit 0; sleep 0.5; done; exit 1`
       );
+
+      if (verifyResult.exitCode !== 0) {
+        let diagnostics = '';
+        if (logFilePath) {
+          const logResult = await exec(
+            `tail -c 4096 ${shellEscape(logFilePath)} 2>/dev/null`
+          );
+          diagnostics = (logResult.stdout || logResult.stderr || '').trim();
+        }
+        throw new S3FSMountError(
+          `S3FS mount did not produce a FUSE filesystem at ${mountPath}. ` +
+            `s3fs exited successfully but the mount was not established within 3 s.` +
+            (diagnostics ? ` s3fs log: ${diagnostics}` : '')
+        );
+      }
+    } finally {
+      if (logFilePath) {
+        await exec(`rm -f ${shellEscape(logFilePath)}`).catch(() => {});
+      }
     }
   }
 

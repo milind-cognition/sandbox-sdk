@@ -16,8 +16,6 @@ export { getSandbox, Sandbox } from './sandbox';
 
 // Legacy types are now imported from the new client architecture
 
-// Required export for egress intercepting
-export { ContainerProxy } from '@cloudflare/containers';
 // Export core SDK types for consumers
 export type {
   BackupOptions,
@@ -130,6 +128,9 @@ export type {
   ExecutionCallbacks,
   InterpreterClient
 } from './clients/interpreter-client.js';
+// Required export for egress intercepting — custom subclass preserves
+// Content-Length on HEAD responses (upstream #660).
+export { ContainerProxy } from './container-proxy';
 // Export backup and process readiness errors
 export {
   BackupCreateError,

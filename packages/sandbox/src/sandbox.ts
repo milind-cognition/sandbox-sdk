@@ -1089,6 +1089,9 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
         await this.deletePasswordFile(passwordFilePath);
       }
 
+      // Remove the mount directory so we don't leave a stale empty dir
+      await this.removeMountDirectory(mountPath);
+
       // Clean up reservation on failure
       this.activeMounts.delete(mountPath);
       throw error;
@@ -1269,7 +1272,29 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
   }
 
   /**
-   * Execute S3FS mount command
+   * Best-effort removal of a mount directory after a failed mount.
+   * Only removes if the path is not an active mountpoint.
+   */
+  private async removeMountDirectory(mountPath: string): Promise<void> {
+    try {
+      await this.execInternal(
+        `mountpoint -q ${shellEscape(mountPath)} || rmdir ${shellEscape(mountPath)} 2>/dev/null`
+      );
+    } catch (error) {
+      this.logger.warn('mount directory cleanup failed', {
+        mountPath,
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
+  }
+
+  /**
+   * Execute S3FS mount command and verify the FUSE filesystem appears.
+   *
+   * s3fs daemonises by default: the parent exits 0 before the child
+   * finishes its bucket check. A successful exit code therefore does
+   * not guarantee the mount is live. We poll `mountpoint -q` to
+   * confirm the kernel mount table entry exists before returning.
    */
   private async executeS3FSMount(
     bucket: string,
@@ -1299,19 +1324,75 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
     // Add endpoint URL
     s3fsArgs.push(`url=${options.endpoint}`);
 
+    // Redirect s3fs stderr to a temp log so we can surface diagnostics
+    const s3fsLogFile = `${passwordFilePath}.log`;
+    s3fsArgs.push(`logfile=${s3fsLogFile}`);
+
     // Build final command with escaped options
     const optionsStr = shellEscape(s3fsArgs.join(','));
     const mountCmd = `s3fs ${shellEscape(bucket)} ${shellEscape(mountPath)} -o ${optionsStr}`;
 
+    const execCmd = sessionId
+      ? (cmd: string) =>
+          this.execWithSession(cmd, sessionId, { origin: 'internal' })
+      : (cmd: string) => this.execInternal(cmd);
+
     // Execute mount command
-    const result = sessionId
-      ? await this.execWithSession(mountCmd, sessionId, { origin: 'internal' })
-      : await this.execInternal(mountCmd);
+    const result = await execCmd(mountCmd);
 
     if (result.exitCode !== 0) {
+      const logTail = await this.readS3fsLog(s3fsLogFile, execCmd);
+      await execCmd(`rm -f ${shellEscape(s3fsLogFile)}`);
       throw new S3FSMountError(
-        `S3FS mount failed: ${result.stderr || result.stdout || 'Unknown error'}`
+        `S3FS mount failed (exit ${result.exitCode}): ${logTail || result.stderr || result.stdout || 'Unknown error'}`
       );
+    }
+
+    // s3fs forks a daemon — poll until the FUSE mount appears
+    const MOUNT_VERIFY_TIMEOUT_MS = 2000;
+    const MOUNT_VERIFY_INTERVAL_MS = 50;
+    const deadline = Date.now() + MOUNT_VERIFY_TIMEOUT_MS;
+    let mounted = false;
+
+    while (Date.now() < deadline) {
+      const check = await execCmd(
+        `mountpoint -q ${shellEscape(mountPath)} && echo MOUNTED || echo NOT_MOUNTED`
+      );
+      if (check.stdout.trim() === 'MOUNTED') {
+        mounted = true;
+        break;
+      }
+      await new Promise((resolve) =>
+        setTimeout(resolve, MOUNT_VERIFY_INTERVAL_MS)
+      );
+    }
+
+    if (!mounted) {
+      const logTail = await this.readS3fsLog(s3fsLogFile, execCmd);
+      await execCmd(`rm -f ${shellEscape(s3fsLogFile)}`);
+      throw new S3FSMountError(
+        `S3FS mount verification failed: FUSE filesystem not found at ${mountPath} after ${MOUNT_VERIFY_TIMEOUT_MS}ms.${logTail ? ` s3fs log: ${logTail}` : ''}`
+      );
+    }
+
+    // Mount succeeded — clean up the log file
+    await execCmd(`rm -f ${shellEscape(s3fsLogFile)}`);
+  }
+
+  /**
+   * Read the tail of the s3fs log file for diagnostics.
+   */
+  private async readS3fsLog(
+    logFile: string,
+    execCmd: (cmd: string) => Promise<ExecResult>
+  ): Promise<string> {
+    try {
+      const logResult = await execCmd(
+        `tail -c 1024 ${shellEscape(logFile)} 2>/dev/null`
+      );
+      return logResult.stdout.trim();
+    } catch {
+      return '';
     }
   }
 
@@ -3883,6 +3964,7 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
       mountInfo.mounted = true;
     } catch (error) {
       await this.deletePasswordFile(passwordFilePath);
+      await this.removeMountDirectory(mountPath);
       this.activeMounts.delete(mountPath);
       throw error;
     }

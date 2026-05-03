@@ -122,6 +122,15 @@ const sandboxConfigurationCache = new WeakMap<
   Map<string, CachedSandboxConfiguration>
 >();
 
+/**
+ * Maximum time to wait for a FUSE filesystem to attach after invoking s3fs.
+ * The s3fs parent forks and exits 0 before the child finishes its bucket
+ * check; we poll until the kernel publishes the new mountpoint.
+ */
+const S3FS_MOUNT_VERIFY_TIMEOUT_MS = 2_000;
+const S3FS_MOUNT_VERIFY_INTERVAL_MS = 50;
+const S3FS_LOG_TAIL_BYTES = 4_096;
+
 function getNamespaceConfigurationCache(
   namespace: object
 ): Map<string, CachedSandboxConfiguration> {
@@ -1089,6 +1098,17 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
         await this.deletePasswordFile(passwordFilePath);
       }
 
+      // Remove the mount-point directory created by `mkdir -p` above. rmdir
+      // only removes empty directories, so this leaves user data alone if
+      // the mount path pre-existed and contained files.
+      try {
+        await this.execInternal(
+          `rmdir ${shellEscape(mountPath)} 2>/dev/null || true`
+        );
+      } catch {
+        // Best-effort cleanup
+      }
+
       // Clean up reservation on failure
       this.activeMounts.delete(mountPath);
       throw error;
@@ -1270,6 +1290,14 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
 
   /**
    * Execute S3FS mount command
+   *
+   * s3fs runs in daemon mode by default: the parent process forks the FUSE
+   * event loop and exits 0 before the child completes its bucket check. A
+   * failed bucket check (auth error, wrong bucket name, network failure)
+   * therefore leaves no FUSE filesystem attached even though the parent
+   * reported success. After invoking s3fs we poll `mountpoint -q <path>`
+   * to confirm the kernel actually attached the filesystem, and capture
+   * the s3fs log so the thrown error carries the underlying reason.
    */
   private async executeS3FSMount(
     bucket: string,
@@ -1299,19 +1327,99 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
     // Add endpoint URL
     s3fsArgs.push(`url=${options.endpoint}`);
 
+    // Capture s3fs output so the thrown error can include the underlying
+    // bucket-check reason ("403 AccessDenied", DNS failure, etc.) instead
+    // of the empty stdout/stderr the daemonising parent produces.
+    const logFilePath = this.generateS3fsLogFilePath();
+    s3fsArgs.push(`logfile=${logFilePath}`);
+
     // Build final command with escaped options
     const optionsStr = shellEscape(s3fsArgs.join(','));
-    const mountCmd = `s3fs ${shellEscape(bucket)} ${shellEscape(mountPath)} -o ${optionsStr}`;
+    const escapedLog = shellEscape(logFilePath);
+    const mountCmd = `s3fs ${shellEscape(bucket)} ${shellEscape(mountPath)} -o ${optionsStr} >>${escapedLog} 2>>${escapedLog}`;
 
-    // Execute mount command
-    const result = sessionId
-      ? await this.execWithSession(mountCmd, sessionId, { origin: 'internal' })
-      : await this.execInternal(mountCmd);
+    const exec = sessionId
+      ? (cmd: string) =>
+          this.execWithSession(cmd, sessionId, { origin: 'internal' })
+      : (cmd: string) => this.execInternal(cmd);
 
-    if (result.exitCode !== 0) {
-      throw new S3FSMountError(
-        `S3FS mount failed: ${result.stderr || result.stdout || 'Unknown error'}`
+    try {
+      const result = await exec(mountCmd);
+
+      if (result.exitCode !== 0) {
+        const detail = await this.readS3fsLogTail(logFilePath, exec);
+        throw new S3FSMountError(
+          `S3FS mount failed: ${detail || result.stderr || result.stdout || 'Unknown error'}`
+        );
+      }
+
+      const verified = await this.waitForMountpoint(mountPath, exec);
+      if (!verified) {
+        const detail = await this.readS3fsLogTail(logFilePath, exec);
+
+        // Detach any orphan FUSE entry the child may have published before
+        // dying so the next mount attempt at this path is unaffected.
+        try {
+          await exec(`fusermount -uz ${shellEscape(mountPath)}`);
+        } catch {
+          // Best-effort detach
+        }
+
+        throw new S3FSMountError(
+          `S3FS mount did not establish at ${mountPath}: ${detail || 'no FUSE filesystem appeared after the s3fs parent exited'}`
+        );
+      }
+    } finally {
+      try {
+        await exec(`rm -f ${escapedLog}`);
+      } catch {
+        // Best-effort log cleanup
+      }
+    }
+  }
+
+  /**
+   * Generate unique path for the s3fs log file used by a single mount call
+   */
+  private generateS3fsLogFilePath(): string {
+    return `/tmp/.s3fs-log-${crypto.randomUUID()}`;
+  }
+
+  /**
+   * Poll `mountpoint -q <path>` until the FUSE filesystem appears or the
+   * deadline expires. Returns true once the path is a mountpoint.
+   */
+  private async waitForMountpoint(
+    mountPath: string,
+    exec: (cmd: string) => Promise<ExecResult>
+  ): Promise<boolean> {
+    const deadline = Date.now() + S3FS_MOUNT_VERIFY_TIMEOUT_MS;
+    const escapedPath = shellEscape(mountPath);
+    while (true) {
+      const result = await exec(`mountpoint -q ${escapedPath}`);
+      if (result.exitCode === 0) return true;
+      if (Date.now() >= deadline) return false;
+      await new Promise((resolve) =>
+        setTimeout(resolve, S3FS_MOUNT_VERIFY_INTERVAL_MS)
       );
+    }
+  }
+
+  /**
+   * Read the tail of the s3fs log file so the thrown error message carries
+   * the underlying reason (auth error, wrong bucket name, network failure).
+   */
+  private async readS3fsLogTail(
+    logFilePath: string,
+    exec: (cmd: string) => Promise<ExecResult>
+  ): Promise<string> {
+    try {
+      const result = await exec(
+        `tail -c ${S3FS_LOG_TAIL_BYTES} ${shellEscape(logFilePath)} 2>/dev/null || true`
+      );
+      return (result.stdout || '').trim();
+    } catch {
+      return '';
     }
   }
 

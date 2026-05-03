@@ -59,6 +59,7 @@ const okResult = (overrides: Partial<ExecResult> = {}): ExecResult => ({
   stderr: '',
   exitCode: 0,
   command: '',
+  duration: 0,
   timestamp: new Date().toISOString(),
   ...overrides
 });
@@ -69,6 +70,7 @@ const failResult = (overrides: Partial<ExecResult> = {}): ExecResult => ({
   stderr: '',
   exitCode: 1,
   command: '',
+  duration: 0,
   timestamp: new Date().toISOString(),
   ...overrides
 });

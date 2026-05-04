@@ -117,6 +117,16 @@ type ConfigurableSandboxStub = {
   ) => Promise<void>;
 };
 
+// s3fs daemonises before completing its bucket auth check, so the parent can
+// exit 0 before the FUSE filesystem actually attaches. After running s3fs we
+// poll mountpoint(1) for up to MOUNT_VERIFY_BUDGET_MS in MOUNT_VERIFY_INTERVAL_MS
+// increments to detect the case where the child later dies (bad credentials,
+// wrong bucket name, network failure, etc.).
+const MOUNT_VERIFY_INTERVAL_MS = 50;
+const MOUNT_VERIFY_BUDGET_MS = 2000;
+// Tail of the s3fs logfile included in S3FSMountError messages.
+const S3FS_LOG_TAIL_BYTES = 4096;
+
 const sandboxConfigurationCache = new WeakMap<
   object,
   Map<string, CachedSandboxConfiguration>
@@ -1023,6 +1033,7 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
     let mountError: Error | undefined;
     let passwordFilePath: string | undefined;
     let provider: BucketProvider | null = null;
+    let mountDirCreated = false;
     try {
       this.validateMountOptions(bucket, mountPath, { ...options, prefix });
 
@@ -1070,6 +1081,7 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
 
       // Create mount directory
       await this.execInternal(`mkdir -p ${shellEscape(mountPath)}`);
+      mountDirCreated = true;
 
       // Execute S3FS mount with password file (uses full s3fs source with prefix)
       await this.executeS3FSMount(
@@ -1087,6 +1099,14 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
       // Clean up password file on failure
       if (passwordFilePath) {
         await this.deletePasswordFile(passwordFilePath);
+      }
+
+      // Remove the mount-point directory we created so a failed mount does
+      // not leave a stale empty directory behind. rmdir refuses non-empty
+      // directories, so this cannot delete user data if the path was
+      // pre-populated.
+      if (mountDirCreated) {
+        await this.removeMountDirectoryIfEmpty(mountPath);
       }
 
       // Clean up reservation on failure
@@ -1269,7 +1289,11 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
   }
 
   /**
-   * Execute S3FS mount command
+   * Execute S3FS mount command and verify the FUSE filesystem actually
+   * attached. s3fs daemonises before completing its bucket auth check, so
+   * the parent can return 0 even when the child later dies. This method
+   * polls mountpoint(1) for a short window and surfaces s3fs log output
+   * via S3FSMountError when the mount never appears.
    */
   private async executeS3FSMount(
     bucket: string,
@@ -1279,39 +1303,131 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
     passwordFilePath: string,
     sessionId?: string
   ): Promise<void> {
-    // Resolve s3fs options (provider defaults + user overrides)
     const resolvedOptions = resolveS3fsOptions(provider, options.s3fsOptions);
+    const logfilePath = this.generateS3fsLogfilePath();
 
-    // Build s3fs mount command
     const s3fsArgs: string[] = [];
-
-    // Add password file option FIRST
     s3fsArgs.push(`passwd_file=${passwordFilePath}`);
-
-    // Add resolved provider-specific and user options
+    // Capture s3fs child output (auth errors, network failures) for diagnostics.
+    // The default dbglevel of "crit" hides 4xx responses, so promote to "err".
+    s3fsArgs.push(`logfile=${logfilePath}`);
+    s3fsArgs.push('dbglevel=err');
     s3fsArgs.push(...resolvedOptions);
 
-    // Add read-only flag if requested
     if (options.readOnly) {
       s3fsArgs.push('ro');
     }
 
-    // Add endpoint URL
     s3fsArgs.push(`url=${options.endpoint}`);
 
-    // Build final command with escaped options
     const optionsStr = shellEscape(s3fsArgs.join(','));
     const mountCmd = `s3fs ${shellEscape(bucket)} ${shellEscape(mountPath)} -o ${optionsStr}`;
 
-    // Execute mount command
-    const result = sessionId
-      ? await this.execWithSession(mountCmd, sessionId, { origin: 'internal' })
-      : await this.execInternal(mountCmd);
+    try {
+      const result = sessionId
+        ? await this.execWithSession(mountCmd, sessionId, {
+            origin: 'internal'
+          })
+        : await this.execInternal(mountCmd);
 
-    if (result.exitCode !== 0) {
-      throw new S3FSMountError(
-        `S3FS mount failed: ${result.stderr || result.stdout || 'Unknown error'}`
+      if (result.exitCode !== 0) {
+        const detail = await this.readS3fsLogTail(logfilePath);
+        throw new S3FSMountError(
+          `S3FS mount failed: ${detail || result.stderr || result.stdout || 'Unknown error'}`
+        );
+      }
+
+      const verified = await this.waitForMountpoint(mountPath, sessionId);
+      if (!verified) {
+        const detail = await this.readS3fsLogTail(logfilePath);
+        throw new S3FSMountError(
+          `S3FS mount verification failed: ${mountPath} never became a mountpoint within ${MOUNT_VERIFY_BUDGET_MS}ms.${detail ? ` s3fs log: ${detail}` : ''}`
+        );
+      }
+    } finally {
+      await this.deleteS3fsLogfile(logfilePath);
+    }
+  }
+
+  /**
+   * Generate unique logfile path for capturing s3fs child output.
+   */
+  private generateS3fsLogfilePath(): string {
+    const uuid = crypto.randomUUID();
+    return `/tmp/.s3fs-log-${uuid}`;
+  }
+
+  /**
+   * Poll mountpoint(1) inside the container until either the path becomes
+   * a mountpoint or the budget elapses. Runs the polling loop in a single
+   * shell command so the per-iteration sleep happens server-side.
+   */
+  private async waitForMountpoint(
+    mountPath: string,
+    sessionId?: string
+  ): Promise<boolean> {
+    const attempts = Math.max(
+      1,
+      Math.ceil(MOUNT_VERIFY_BUDGET_MS / MOUNT_VERIFY_INTERVAL_MS)
+    );
+    const sleepSeconds = (MOUNT_VERIFY_INTERVAL_MS / 1000).toFixed(3);
+    const escapedPath = shellEscape(mountPath);
+    const verifyCmd = `for _ in $(seq 1 ${attempts}); do mountpoint -q ${escapedPath} && exit 0; sleep ${sleepSeconds}; done; exit 1`;
+
+    const result = sessionId
+      ? await this.execWithSession(verifyCmd, sessionId, { origin: 'internal' })
+      : await this.execInternal(verifyCmd);
+
+    return result.exitCode === 0;
+  }
+
+  /**
+   * Read the tail of the s3fs logfile for inclusion in error messages.
+   * Returns an empty string when the file is missing or unreadable.
+   */
+  private async readS3fsLogTail(logfilePath: string): Promise<string> {
+    try {
+      const cmd = `test -f ${shellEscape(logfilePath)} && tail -c ${S3FS_LOG_TAIL_BYTES} ${shellEscape(logfilePath)} || true`;
+      const result = await this.execInternal(cmd);
+      return result.stdout.trim();
+    } catch (error) {
+      this.logger.debug('s3fs logfile read failed', {
+        logfilePath,
+        error: error instanceof Error ? error.message : String(error)
+      });
+      return '';
+    }
+  }
+
+  /**
+   * Delete the s3fs logfile after the mount attempt completes.
+   */
+  private async deleteS3fsLogfile(logfilePath: string): Promise<void> {
+    try {
+      await this.execInternal(`rm -f ${shellEscape(logfilePath)}`);
+    } catch (error) {
+      this.logger.debug('s3fs logfile cleanup failed', {
+        logfilePath,
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
+  }
+
+  /**
+   * Best-effort removal of an empty mount-point directory after a failed
+   * mount. Uses rmdir, which refuses non-empty directories.
+   */
+  private async removeMountDirectoryIfEmpty(mountPath: string): Promise<void> {
+    try {
+      // 2>/dev/null suppresses "directory not empty" / "no such file" noise.
+      await this.execInternal(
+        `rmdir ${shellEscape(mountPath)} 2>/dev/null || true`
       );
+    } catch (error) {
+      this.logger.debug('mount directory cleanup failed', {
+        mountPath,
+        error: error instanceof Error ? error.message : String(error)
+      });
     }
   }
 

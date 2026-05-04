@@ -1327,4 +1327,185 @@ describe('Sandbox - Automatic Session Management', () => {
       expect(createArchiveSpy).not.toHaveBeenCalled();
     });
   });
+
+  describe('mountBucket - FUSE mount verification', () => {
+    interface ExecuteResult {
+      success: boolean;
+      stdout: string;
+      stderr: string;
+      exitCode: number;
+      command: string;
+      timestamp: string;
+    }
+
+    function makeResult(
+      command: string,
+      exitCode: number,
+      stdout = '',
+      stderr = ''
+    ): ExecuteResult {
+      return {
+        success: exitCode === 0,
+        stdout,
+        stderr,
+        exitCode,
+        command,
+        timestamp: new Date().toISOString()
+      };
+    }
+
+    const mountOptions = {
+      endpoint: 'https://acct.r2.cloudflarestorage.com',
+      credentials: {
+        accessKeyId: 'AKID',
+        secretAccessKey: 'SECRET'
+      }
+    };
+
+    it('throws S3FSMountError and rolls back when mountpoint never attaches', async () => {
+      const ranCommands: string[] = [];
+      const writtenFiles: string[] = [];
+
+      vi.spyOn(sandbox.client.commands, 'execute').mockImplementation((async (
+        command: string
+      ) => {
+        ranCommands.push(command);
+
+        if (command.includes('mountpoint -q')) {
+          return makeResult(command, 1);
+        }
+        if (command.includes('tail -c')) {
+          return makeResult(
+            command,
+            0,
+            '[ERR] s3fs: HEAD bucket request failed (403 AccessDenied)'
+          );
+        }
+        return makeResult(command, 0);
+      }) as never);
+
+      vi.spyOn(sandbox.client.files, 'writeFile').mockImplementation((async (
+        path: string
+      ) => {
+        writtenFiles.push(path);
+        return {
+          success: true,
+          path,
+          timestamp: new Date().toISOString()
+        };
+      }) as never);
+
+      await expect(
+        sandbox.mountBucket('mybucket', '/mnt/data', mountOptions)
+      ).rejects.toMatchObject({
+        name: 'S3FSMountError',
+        message: expect.stringContaining('S3FS mount verification failed')
+      });
+
+      expect(ranCommands.some((c) => c.startsWith('s3fs '))).toBe(true);
+      expect(ranCommands.some((c) => c.includes('mountpoint -q'))).toBe(true);
+      expect(writtenFiles.some((p) => p.startsWith('/tmp/.passwd-s3fs-'))).toBe(
+        true
+      );
+      expect(
+        ranCommands.some((c) => /^rm -f .*\/tmp\/\.passwd-s3fs-/.test(c))
+      ).toBe(true);
+      expect(ranCommands.some((c) => c.startsWith('rmdir '))).toBe(true);
+      expect(
+        ranCommands.some((c) => /^rm -f .*\/tmp\/\.s3fs-log-/.test(c))
+      ).toBe(true);
+      expect((sandbox as any).activeMounts.has('/mnt/data')).toBe(false);
+    });
+
+    it('includes the s3fs log tail in the thrown error message', async () => {
+      const logTail =
+        '[ERR] curl response code 403 unable to authenticate to bucket';
+
+      vi.spyOn(sandbox.client.commands, 'execute').mockImplementation((async (
+        command: string
+      ) => {
+        if (command.includes('mountpoint -q')) {
+          return makeResult(command, 1);
+        }
+        if (command.includes('tail -c')) {
+          return makeResult(command, 0, logTail);
+        }
+        return makeResult(command, 0);
+      }) as never);
+
+      await expect(
+        sandbox.mountBucket('mybucket', '/mnt/data', mountOptions)
+      ).rejects.toThrow(logTail);
+    });
+
+    it('passes logfile and dbglevel options to s3fs', async () => {
+      let s3fsCommand: string | undefined;
+
+      vi.spyOn(sandbox.client.commands, 'execute').mockImplementation((async (
+        command: string
+      ) => {
+        if (command.startsWith('s3fs ')) {
+          s3fsCommand = command;
+        }
+        if (command.includes('mountpoint -q')) {
+          return makeResult(command, 0);
+        }
+        return makeResult(command, 0);
+      }) as never);
+
+      await sandbox.mountBucket('mybucket', '/mnt/data', mountOptions);
+
+      expect(s3fsCommand).toBeDefined();
+      expect(s3fsCommand).toMatch(/logfile=\/tmp\/\.s3fs-log-/);
+      expect(s3fsCommand).toMatch(/dbglevel=err/);
+    });
+
+    it('resolves successfully when verification passes', async () => {
+      vi.spyOn(sandbox.client.commands, 'execute').mockImplementation((async (
+        command: string
+      ) => {
+        if (command.includes('mountpoint -q')) {
+          return makeResult(command, 0);
+        }
+        return makeResult(command, 0);
+      }) as never);
+
+      await expect(
+        sandbox.mountBucket('mybucket', '/mnt/data', mountOptions)
+      ).resolves.toBeUndefined();
+
+      expect((sandbox as any).activeMounts.has('/mnt/data')).toBe(true);
+    });
+
+    it('preserves existing rollback when s3fs itself exits non-zero', async () => {
+      const ranCommands: string[] = [];
+
+      vi.spyOn(sandbox.client.commands, 'execute').mockImplementation((async (
+        command: string
+      ) => {
+        ranCommands.push(command);
+
+        if (command.startsWith('s3fs ')) {
+          return makeResult(command, 1, '', 'fuse: bad mount point');
+        }
+        if (command.includes('tail -c')) {
+          return makeResult(command, 0, '');
+        }
+        return makeResult(command, 0);
+      }) as never);
+
+      await expect(
+        sandbox.mountBucket('mybucket', '/mnt/data', mountOptions)
+      ).rejects.toMatchObject({
+        name: 'S3FSMountError',
+        message: expect.stringContaining('fuse: bad mount point')
+      });
+
+      expect(ranCommands.some((c) => c.includes('mountpoint -q'))).toBe(false);
+      expect(
+        ranCommands.some((c) => /^rm -f .*\/tmp\/\.passwd-s3fs-/.test(c))
+      ).toBe(true);
+      expect((sandbox as any).activeMounts.has('/mnt/data')).toBe(false);
+    });
+  });
 });

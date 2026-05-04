@@ -187,4 +187,34 @@ describe('POST /v1/sandbox/:id/mount', () => {
     expect(body.code).toBe('mount_error');
     expect(body.error).toContain('Mount path already in use');
   });
+
+  it('returns 502 with s3fs log tail when the FUSE mount silently fails', async () => {
+    class S3FSMountError extends Error {
+      constructor(message: string) {
+        super(message);
+        this.name = 'S3FSMountError';
+      }
+    }
+    mockSandbox.mountBucket.mockRejectedValue(
+      new S3FSMountError(
+        'S3FS mount verification failed: /mnt/data never became a mountpoint within 2000ms. ' +
+          's3fs log: [ERR] s3fs: HEAD bucket request failed (403 AccessDenied)'
+      )
+    );
+
+    const res = await mountRequest({
+      bucket: 'typo-bucket',
+      mountPath: '/mnt/data',
+      options: {
+        endpoint: 'https://acct.r2.cloudflarestorage.com',
+        credentials: { accessKeyId: 'AKID', secretAccessKey: 'SECRET' }
+      }
+    });
+
+    expect(res.status).toBe(502);
+    const body = (await res.json()) as { error: string; code: string };
+    expect(body.code).toBe('mount_error');
+    expect(body.error).toContain('S3FS mount verification failed');
+    expect(body.error).toContain('403 AccessDenied');
+  });
 });

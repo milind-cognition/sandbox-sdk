@@ -1089,6 +1089,11 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
         await this.deletePasswordFile(passwordFilePath);
       }
 
+      // Drop the mount-point directory we created so a failed mount does not
+      // leave a stale empty path behind. rmdir is non-destructive: it refuses
+      // to touch a non-empty directory or one the user already populated.
+      await this.cleanupMountPathDirectory(mountPath);
+
       // Clean up reservation on failure
       this.activeMounts.delete(mountPath);
       throw error;
@@ -1270,6 +1275,13 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
 
   /**
    * Execute S3FS mount command
+   *
+   * s3fs forks a daemon and the parent exits 0 before the FUSE filesystem
+   * appears in the kernel mount table. The bucket / SigV4 check runs in the
+   * child, so a successful exit code does not imply a working mount. After
+   * invoking s3fs we poll mountpoint(1) until the path is registered and, if
+   * verification fails, surface the captured s3fs log (e.g. 403 AccessDenied,
+   * connection errors) instead of an empty error.
    */
   private async executeS3FSMount(
     bucket: string,
@@ -1281,6 +1293,10 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
   ): Promise<void> {
     // Resolve s3fs options (provider defaults + user overrides)
     const resolvedOptions = resolveS3fsOptions(provider, options.s3fsOptions);
+
+    // s3fs writes diagnostic output here so the SDK can include it in error
+    // messages when the parent exit code does not reflect the real failure.
+    const logFilePath = `/tmp/.s3fs-log-${crypto.randomUUID()}`;
 
     // Build s3fs mount command
     const s3fsArgs: string[] = [];
@@ -1299,19 +1315,138 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
     // Add endpoint URL
     s3fsArgs.push(`url=${options.endpoint}`);
 
+    // Capture s3fs daemon output so failures after fork are diagnosable.
+    s3fsArgs.push(`logfile=${logFilePath}`);
+
     // Build final command with escaped options
     const optionsStr = shellEscape(s3fsArgs.join(','));
     const mountCmd = `s3fs ${shellEscape(bucket)} ${shellEscape(mountPath)} -o ${optionsStr}`;
 
-    // Execute mount command
-    const result = sessionId
-      ? await this.execWithSession(mountCmd, sessionId, { origin: 'internal' })
-      : await this.execInternal(mountCmd);
+    try {
+      // Execute mount command
+      const result = sessionId
+        ? await this.execWithSession(mountCmd, sessionId, {
+            origin: 'internal'
+          })
+        : await this.execInternal(mountCmd);
 
-    if (result.exitCode !== 0) {
-      throw new S3FSMountError(
-        `S3FS mount failed: ${result.stderr || result.stdout || 'Unknown error'}`
+      if (result.exitCode !== 0) {
+        const logTail = await this.readS3fsLogTail(logFilePath, sessionId);
+        const detail =
+          result.stderr || result.stdout || logTail || 'Unknown error';
+        throw new S3FSMountError(`S3FS mount failed: ${detail}`);
+      }
+
+      await this.verifyMountEstablished(mountPath, logFilePath, sessionId);
+    } finally {
+      await this.deleteS3fsLog(logFilePath, sessionId);
+    }
+  }
+
+  /**
+   * Poll mountpoint(1) until the path is a FUSE mount or the deadline passes.
+   *
+   * s3fs daemonises before the bucket / auth check completes, so this is the
+   * authoritative signal that the mount actually established. If the path
+   * never becomes a mountpoint, throw S3FSMountError with the tail of the
+   * s3fs log so the caller sees the real reason (auth, network, bucket name).
+   */
+  private async verifyMountEstablished(
+    mountPath: string,
+    logFilePath: string,
+    sessionId?: string
+  ): Promise<void> {
+    const maxAttempts = 40;
+    const intervalMs = 50;
+    const checkCmd = `mountpoint -q ${shellEscape(mountPath)}`;
+
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      const check = sessionId
+        ? await this.execWithSession(checkCmd, sessionId, {
+            origin: 'internal'
+          })
+        : await this.execInternal(checkCmd);
+
+      if (check.exitCode === 0) {
+        return;
+      }
+
+      if (attempt < maxAttempts - 1) {
+        await new Promise((resolve) => setTimeout(resolve, intervalMs));
+      }
+    }
+
+    const logTail = await this.readS3fsLogTail(logFilePath, sessionId);
+    const detail = logTail
+      ? `s3fs log: ${logTail}`
+      : 'No s3fs log output captured.';
+    throw new S3FSMountError(
+      `S3FS mount did not establish at ${mountPath} within ${
+        (maxAttempts * intervalMs) / 1000
+      }s. ${detail}`
+    );
+  }
+
+  /**
+   * Read the last few KB of the s3fs log so the diagnostic message stays
+   * bounded even if s3fs ran for a while before failing.
+   */
+  private async readS3fsLogTail(
+    logFilePath: string,
+    sessionId?: string
+  ): Promise<string> {
+    try {
+      const cmd = `tail -c 4096 ${shellEscape(logFilePath)} 2>/dev/null || true`;
+      const result = sessionId
+        ? await this.execWithSession(cmd, sessionId, { origin: 'internal' })
+        : await this.execInternal(cmd);
+      return (result.stdout ?? '').trim();
+    } catch {
+      return '';
+    }
+  }
+
+  /**
+   * Best-effort cleanup of the s3fs logfile. Logs only contain s3fs diagnostic
+   * output, but we still remove them after every mount attempt to avoid leaving
+   * one file per mount in /tmp.
+   */
+  private async deleteS3fsLog(
+    logFilePath: string,
+    sessionId?: string
+  ): Promise<void> {
+    try {
+      const cmd = `rm -f ${shellEscape(logFilePath)}`;
+      if (sessionId) {
+        await this.execWithSession(cmd, sessionId, { origin: 'internal' });
+      } else {
+        await this.execInternal(cmd);
+      }
+    } catch (error) {
+      this.logger.warn('s3fs log cleanup failed', {
+        logFilePath,
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
+  }
+
+  /**
+   * Remove the mount-point directory created during a failed mount. rmdir is
+   * a no-op for non-empty directories, so user-populated paths are preserved.
+   * The mountpoint guard prevents removing a directory that did manage to
+   * register as a mount.
+   */
+  private async cleanupMountPathDirectory(mountPath: string): Promise<void> {
+    try {
+      const quoted = shellEscape(mountPath);
+      await this.execInternal(
+        `mountpoint -q ${quoted} || rmdir ${quoted} 2>/dev/null || true`
       );
+    } catch (error) {
+      this.logger.warn('mount path cleanup failed', {
+        mountPath,
+        error: error instanceof Error ? error.message : String(error)
+      });
     }
   }
 

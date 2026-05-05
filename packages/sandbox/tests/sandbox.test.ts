@@ -1,6 +1,7 @@
 import { Container } from '@cloudflare/containers';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { connect, Sandbox } from '../src/sandbox';
+import { S3FSMountError } from '../src/storage-mount/errors';
 
 // Mock dependencies before imports
 vi.mock('./interpreter', () => ({
@@ -1326,5 +1327,166 @@ describe('Sandbox - Automatic Session Management', () => {
 
       expect(createArchiveSpy).not.toHaveBeenCalled();
     });
+  });
+});
+
+describe('Sandbox - mountBucket failure handling', () => {
+  let sandbox: Sandbox;
+  let mockCtx: MockCtx;
+
+  beforeEach(async () => {
+    vi.clearAllMocks();
+
+    mockCtx = {
+      storage: {
+        get: vi.fn().mockResolvedValue(null),
+        put: vi.fn().mockResolvedValue(undefined),
+        delete: vi.fn().mockResolvedValue(undefined),
+        list: vi.fn().mockResolvedValue(new Map())
+      } as any,
+      blockConcurrencyWhile: vi
+        .fn()
+        .mockImplementation(
+          <T>(callback: () => Promise<T>): Promise<T> => callback()
+        ),
+      waitUntil: vi.fn(),
+      id: {
+        toString: () => 'test-mount-sandbox-id',
+        equals: vi.fn(),
+        name: 'test-mount-sandbox'
+      } as any
+    };
+
+    sandbox = new Sandbox(
+      mockCtx as unknown as ConstructorParameters<typeof Sandbox>[0],
+      {
+        AWS_ACCESS_KEY_ID: 'AKID',
+        AWS_SECRET_ACCESS_KEY: 'SECRET'
+      }
+    );
+
+    await vi.waitFor(() => {
+      expect(mockCtx.blockConcurrencyWhile).toHaveBeenCalled();
+    });
+
+    vi.spyOn(sandbox.client.utils, 'createSession').mockResolvedValue({
+      success: true,
+      id: 'mount-session',
+      message: 'Created'
+    } as any);
+
+    vi.spyOn(sandbox, 'writeFile').mockResolvedValue({
+      success: true,
+      exitCode: 0,
+      path: '/tmp/.passwd-s3fs-test'
+    } as any);
+  });
+
+  it('throws S3FSMountError when s3fs daemonises but mount never establishes', async () => {
+    // Simulate the upstream bug: s3fs exits 0 because the bucket-check failure
+    // happens in the forked child, but no FUSE mount is ever attached so
+    // mountpoint -q always returns 1.
+    vi.spyOn(sandbox as any, 'execWithSession').mockImplementation((async (
+      cmd: string
+    ) => {
+      if (cmd.startsWith('mountpoint -q')) {
+        return { stdout: '', stderr: '', exitCode: 1 };
+      }
+      if (cmd.startsWith('tail -c')) {
+        return {
+          stdout:
+            '[ERR] s3fs.cpp:s3fs_check_service: Failed to check bucket. ' +
+            '403 AccessDenied: bucket does not exist or is not accessible.\n',
+          stderr: '',
+          exitCode: 0
+        };
+      }
+      return { stdout: '', stderr: '', exitCode: 0 };
+    }) as any);
+
+    await expect(
+      sandbox.mountBucket('bogus-bucket', '/mnt/bogus', {
+        endpoint: 'https://acct.r2.cloudflarestorage.com'
+      })
+    ).rejects.toThrow(S3FSMountError);
+
+    await expect(
+      sandbox.mountBucket('bogus-bucket', '/mnt/bogus', {
+        endpoint: 'https://acct.r2.cloudflarestorage.com'
+      })
+    ).rejects.toThrow(/did not establish/);
+  }, 10_000);
+
+  it('rolls back password file, mount-point directory, and reservation when mount fails', async () => {
+    const execSpy = vi
+      .spyOn(sandbox as any, 'execWithSession')
+      .mockImplementation((async (cmd: string) => {
+        if (cmd.startsWith('mountpoint -q')) {
+          return { stdout: '', stderr: '', exitCode: 1 };
+        }
+        if (cmd.startsWith('tail -c')) {
+          return { stdout: 'access denied', stderr: '', exitCode: 0 };
+        }
+        return { stdout: '', stderr: '', exitCode: 0 };
+      }) as any);
+
+    await expect(
+      sandbox.mountBucket('bogus', '/mnt/bogus', {
+        endpoint: 'https://acct.r2.cloudflarestorage.com'
+      })
+    ).rejects.toThrow(S3FSMountError);
+
+    const commands = execSpy.mock.calls.map((call) => call[0] as string);
+
+    expect(commands.some((cmd) => /^rm -f .*\.passwd-s3fs-/.test(cmd))).toBe(
+      true
+    );
+    expect(
+      commands.some(
+        (cmd) => cmd.includes('rmdir') && cmd.includes('/mnt/bogus')
+      )
+    ).toBe(true);
+    expect((sandbox as any).activeMounts.has('/mnt/bogus')).toBe(false);
+  }, 10_000);
+
+  it('returns successfully when the mount establishes', async () => {
+    vi.spyOn(sandbox as any, 'execWithSession').mockImplementation((async (
+      cmd: string
+    ) => {
+      if (cmd.startsWith('mountpoint -q')) {
+        return { stdout: '', stderr: '', exitCode: 0 };
+      }
+      return { stdout: '', stderr: '', exitCode: 0 };
+    }) as any);
+
+    await expect(
+      sandbox.mountBucket('mybucket', '/mnt/data', {
+        endpoint: 'https://acct.r2.cloudflarestorage.com'
+      })
+    ).resolves.toBeUndefined();
+
+    expect((sandbox as any).activeMounts.has('/mnt/data')).toBe(true);
+  });
+
+  it('passes -o logfile=… to s3fs so failure messages can be captured', async () => {
+    let capturedMountCmd: string | undefined;
+    vi.spyOn(sandbox as any, 'execWithSession').mockImplementation((async (
+      cmd: string
+    ) => {
+      if (cmd.startsWith('s3fs ')) {
+        capturedMountCmd = cmd;
+      }
+      if (cmd.startsWith('mountpoint -q')) {
+        return { stdout: '', stderr: '', exitCode: 0 };
+      }
+      return { stdout: '', stderr: '', exitCode: 0 };
+    }) as any);
+
+    await sandbox.mountBucket('mybucket', '/mnt/data', {
+      endpoint: 'https://acct.r2.cloudflarestorage.com'
+    });
+
+    expect(capturedMountCmd).toBeDefined();
+    expect(capturedMountCmd).toMatch(/logfile=\/tmp\/\.s3fs-log-/);
   });
 });

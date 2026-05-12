@@ -128,8 +128,8 @@ export type {
   ExecutionCallbacks,
   InterpreterClient
 } from './clients/interpreter-client.js';
-// Required export for egress intercepting — custom subclass preserves
-// Content-Length on HEAD responses (upstream #660).
+// Required export for egress intercepting — custom subclass rebuilds HEAD
+// responses so Content-Length is not zeroed across service-binding boundaries.
 export { ContainerProxy } from './container-proxy';
 // Export backup and process readiness errors
 export {
